@@ -1,0 +1,33 @@
+name: Watchman Digest
+
+# Fires twice so the 6 AM Central briefing lands year-round without
+# touching this file when the clocks change:
+#   11:00 UTC = 6 AM CDT (summer)   12:00 UTC = 6 AM CST (winter)
+# The script itself checks the local hour and only sends on the right one.
+# workflow_dispatch lets you run it by hand from the Actions tab to test —
+# a manual run always sends, whatever the clock says.
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Send the morning briefing
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          DIGEST_TO: ${{ secrets.DIGEST_TO }}
+          DIGEST_FROM: ${{ secrets.DIGEST_FROM }}
+        run: node digest.mjs
