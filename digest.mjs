@@ -6,10 +6,15 @@
 // from Supabase (active tasks due today or overdue, hottest first),
 // formats it in the Watchman's voice, and sends it via Resend.
 //
+// UPGRADE: also reads v_waiting_due — waiting tasks whose follow-up (chase)
+// date has arrived — and adds a "STILL WAITING — TIME TO CHASE" block so a
+// silent hand-off can't sit forever. That block is best-effort: if the view
+// isn't there yet, the digest still sends its normal due list.
+//
 // Zero npm dependencies — Node 24 has fetch + Intl built in.
 // Everything it needs comes from environment (GitHub secrets):
 //   SUPABASE_URL                 e.g. https://xxxxx.supabase.co
-//   SUPABASE_SERVICE_ROLE_KEY    (bypasses RLS to read the view)
+//   SUPABASE_SERVICE_ROLE_KEY    (bypasses RLS to read the views)
 //   RESEND_API_KEY               (sending access)
 //   DIGEST_TO                    where the briefing lands
 //   DIGEST_FROM                  verified Resend sender
@@ -43,13 +48,15 @@ for (const [k, v] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, R
 
 // ── Local time helpers (DST-proof via Intl) ─────────────────
 const localParts = (tz) => {
+  // Numeric parts only. (An earlier version duplicated `month` with a "short"
+  // spelling, which won the key and made month = "Jul" → todayISO = NaN → the
+  // overdue math silently died. Keep this strictly 2-digit.)
   const f = new Intl.DateTimeFormat("en-CA", {
     timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", hour12: false, weekday: "short", month: "short",
+    hour: "2-digit", hour12: false,
   });
-  // build a lookup from the formatted parts
   const p = Object.fromEntries(f.formatToParts(new Date()).map((x) => [x.type, x.value]));
-  return p; // { year, month, day, hour, weekday, ... }
+  return p; // { year, month, day, hour }
 };
 
 const tz = DIGEST_TZ;
@@ -57,24 +64,20 @@ const now = localParts(tz);
 const localHour = parseInt(now.hour, 10);
 const isManual = GITHUB_EVENT_NAME === "workflow_dispatch";
 
-// The workflow fires at both 11:00 and 12:00 UTC to cover CST/CDT.
-// Only the run that lands on the target local hour actually sends —
-// unless you triggered it by hand (then always send, for testing).
 if (!isManual && localHour !== parseInt(DIGEST_HOUR, 10)) {
   console.log(`Local hour is ${localHour} in ${tz}; target is ${DIGEST_HOUR}. Standing down.`);
   process.exit(0);
 }
 
-// Chicago "today" as YYYY-MM-DD, for honest overdue math.
 const todayISO = `${now.year}-${now.month.length === 2 ? now.month : "0" + now.month}-${now.day}`;
 const todayLabel = (() => {
   const f = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", month: "short", day: "numeric" });
   return f.format(new Date());
 })();
 
-// ── Pull what's due ─────────────────────────────────────────
-async function fetchDue() {
-  const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/v_due_now?select=*`;
+// ── Reads ───────────────────────────────────────────────────
+async function readView(view, { fatal }) {
+  const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/${view}?select=*`;
   const res = await fetch(url, {
     headers: {
       apikey: SUPABASE_SERVICE_ROLE_KEY,
@@ -84,10 +87,15 @@ async function fetchDue() {
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    die(`Supabase read failed (${res.status}): ${body.slice(0, 300)}`);
+    if (fatal) die(`Supabase read of ${view} failed (${res.status}): ${body.slice(0, 300)}`);
+    console.error(`Read of ${view} skipped (${res.status}): ${body.slice(0, 200)}`);
+    return [];
   }
   return res.json();
 }
+
+const fetchDue = () => readView("v_due_now", { fatal: true });
+const fetchWaitingDue = () => readView("v_waiting_due", { fatal: false }); // best-effort
 
 // ── Formatting ──────────────────────────────────────────────
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -135,15 +143,42 @@ function rowHtml(t) {
   </tr>`;
 }
 
-function buildEmail(rows) {
+// A waiting-to-chase card. The left rail is amber (signal, not alert) so it
+// reads as "your move" rather than "overdue task."
+function waitingRowHtml(t) {
+  const over = daysOver(t.follow_up_on); // >= 0 (view only returns arrived ones)
+  const chipTxt = over > 0 ? `WAITING ${over}D` : "CHASE TODAY";
+  const who = t.waiting_on
+    ? `<span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:${C.bone};border:1px solid ${C.line};border-radius:4px;padding:1px 6px;">on ${esc(t.waiting_on)}</span>`
+    : "";
+  const note = t.note ? `<div style="font-family:'Inter',Arial,sans-serif;font-size:12px;color:${C.mute};margin-top:5px;">${esc(t.note)}</div>` : "";
+  return `
+  <tr>
+    <td style="padding:0 0 8px 0;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${C.panel};border:1px solid ${C.line};border-left:3px solid ${C.signal};border-radius:9px;">
+        <tr><td style="padding:13px 14px;">
+          <div style="font-family:'Inter',Arial,sans-serif;font-size:15px;line-height:1.35;color:${C.bone};">${esc(t.title)}</div>
+          <div style="margin-top:7px;">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:${C.bone};background:${C.raise};border:1px solid ${C.line};border-radius:4px;padding:2px 7px;">${esc(t.brand_short || t.brand_id)}</span>
+            ${who}
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10px;color:${C.signal};border:1px solid rgba(242,161,21,.35);border-radius:4px;padding:2px 7px;">⧗ ${chipTxt}</span>
+          </div>
+          ${note}
+        </td></tr>
+      </table>
+    </td>
+  </tr>`;
+}
+
+function buildEmail(rows, waiting) {
   const overdue = rows.filter((r) => daysOver(r.due_date) > 0).length;
-  const today = rows.length - overdue;
 
-  const summary = rows.length === 0
-    ? "The wall's quiet. Nothing due, nothing over."
-    : `${rows.length} standing${overdue ? ` · <span style="color:${C.alert};">${overdue} over the line</span>` : ""}.`;
+  const parts = [];
+  if (rows.length) parts.push(`${rows.length} standing${overdue ? ` · <span style="color:${C.alert};">${overdue} over the line</span>` : ""}`);
+  if (waiting.length) parts.push(`<span style="color:${C.signal};">${waiting.length} to chase</span>`);
+  const summary = parts.length ? parts.join(" · ") + "." : "The wall's quiet. Nothing due, nothing over, no one to chase.";
 
-  const body = rows.length === 0
+  const dueBody = rows.length === 0
     ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0">
          <tr><td style="border:1px dashed ${C.line};border-radius:10px;padding:34px 20px;text-align:center;">
            <div style="font-family:'Oswald',Arial,sans-serif;text-transform:uppercase;letter-spacing:.08em;font-size:15px;color:${C.bone};">Gate clear</div>
@@ -151,6 +186,14 @@ function buildEmail(rows) {
          </td></tr>
        </table>`
     : `<table role="presentation" width="100%" cellpadding="0" cellspacing="0">${rows.map(rowHtml).join("")}</table>`;
+
+  // The waiting-to-chase section — only rendered when something's actually due to chase.
+  const waitingSection = waiting.length
+    ? `<tr><td style="padding:22px 2px 0 2px;">
+         <div style="font-family:'Oswald',Arial,sans-serif;text-transform:uppercase;letter-spacing:.1em;font-size:12px;color:${C.signal};border-top:1px solid ${C.line};padding-top:16px;margin-bottom:10px;">Still waiting — time to chase</div>
+         <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${waiting.map(waitingRowHtml).join("")}</table>
+       </td></tr>`
+    : "";
 
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -173,8 +216,11 @@ function buildEmail(rows) {
         <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:${C.mute};letter-spacing:.06em;margin-top:8px;">MORNING BRIEFING · ${summary}</div>
       </td></tr>
 
-      <!-- body -->
-      <tr><td style="padding:18px 2px 0 2px;">${body}</td></tr>
+      <!-- due body -->
+      <tr><td style="padding:18px 2px 0 2px;">${dueBody}</td></tr>
+
+      <!-- waiting-to-chase -->
+      ${waitingSection}
 
       <!-- footer -->
       <tr><td style="padding:20px 2px 0 2px;border-top:1px solid ${C.line};">
@@ -188,9 +234,12 @@ function buildEmail(rows) {
 </table>
 </body></html>`;
 
-  const subject = rows.length === 0
-    ? `Watchman: wall's quiet — ${todayLabel}`
-    : `Watchman: ${rows.length} due${overdue ? ` (${overdue} over)` : ""} — ${todayLabel}`;
+  const bits = [];
+  if (rows.length) bits.push(`${rows.length} due${overdue ? ` (${overdue} over)` : ""}`);
+  if (waiting.length) bits.push(`${waiting.length} to chase`);
+  const subject = bits.length
+    ? `Watchman: ${bits.join(", ")} — ${todayLabel}`
+    : `Watchman: wall's quiet — ${todayLabel}`;
 
   return { subject, html };
 }
@@ -212,8 +261,8 @@ async function send({ subject, html }) {
 
 // ── Run ─────────────────────────────────────────────────────
 (async () => {
-  const rows = await fetchDue();
-  console.log(`Read ${rows.length} due item(s) from v_due_now.`);
-  const email = buildEmail(rows);
+  const [rows, waiting] = await Promise.all([fetchDue(), fetchWaitingDue()]);
+  console.log(`Read ${rows.length} due item(s) from v_due_now, ${waiting.length} to chase from v_waiting_due.`);
+  const email = buildEmail(rows, waiting);
   await send(email);
 })().catch((e) => die(e?.message || String(e)));
